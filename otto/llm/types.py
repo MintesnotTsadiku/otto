@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
-Provider = Literal["Anthropic", "OpenAI", "Google"]
+Provider = Literal["Anthropic", "OpenAI", "Google", "Groq"]
 ModelSize = Literal["Very Small", "Small", "Medium", "Large"]
 
 

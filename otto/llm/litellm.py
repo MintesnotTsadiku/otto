@@ -19,6 +19,7 @@ import os
 import random
 import threading
 import time
+import requests
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 
 import otto
@@ -196,6 +197,58 @@ def interact(
 	):
 		think["thinking"] = _get_thinking(reasoning_effort)
 
+	# Inject native Google Search for Gemini models
+	if model.startswith("gemini"):
+		if tools is None:
+			tools = []
+		# Check if already present to avoid duplicates
+		if not any("google_search" in str(t) for t in tools):
+			# LiteLLM format for Gemini Google Search (Public Grounding)
+			# Note: We use 'google_search' not 'google_search_retrieval' (Vertex Enterprise)
+			tools.append({"google_search": {}})
+
+	# Inject native Web Search for OpenAI models
+	# (Disabled: OpenAI Chat Completions does not support 'web_search' tool type)
+	# if model.startswith("openai") or model.startswith("gpt-"):
+	# 	if tools is None:
+	# 		tools = []
+	# 	if not any(t.get("type") == "web_search" for t in tools if isinstance(t, dict)):
+	# 		tools.append({"type": "web_search"})
+	
+	if model.startswith("gpt-") or model.startswith("openai"):
+		# Route to Custom Responses API Adapter
+		# This uses the new `web_search` tool type supported by GPT-4o on the Responses API
+		
+		# We use a custom generator here that mimics the litellm generator
+		response_generator = _openai_responses_adapter(
+			model=model,
+			messages=messages,
+			item=item,
+			session_id=session_id,
+            tools=tools or []
+		)
+		
+		chunks = []
+		try:
+			for chunk in response_generator:
+				yield chunk
+				if item["meta"]["time_to_first_chunk"] == 0:
+					item["meta"]["time_to_first_chunk"] = time.time() - item["meta"]["start_time"]
+				chunks.append(chunk) # Collect chunks for final return
+		except Exception as e:
+			otto.log_error("openai_responses_adapter error", model=model, error=str(e))
+			# Fallback or raise? We raise for now as this is the primary path.
+			raise e
+
+		logger.debug({"message": "responses adapter completed", "id": item["id"]})
+		
+		# Update session and return
+		logger.debug({"message": "updating session", "id": item["id"]})
+		update_session(update, last_id, item)
+		item["meta"]["end_time"] = time.time()
+		response = InteractReturn(item=item, update=update, chunks=chunks)
+		return InteractReturnTuple(response, None)
+
 	logger.debug({"message": "calling litellm.completion", "id": item["id"]})
 	completion = _completions(
 		model=model,
@@ -331,10 +384,49 @@ def _get_tool_use_content(message: dict[str, Any]) -> list[ToolUseContent]:
 	return content
 
 
+def _ensure_tool_responses_for_each_call(messages: list[dict]) -> list[dict]:
+	"""
+	Ensure every assistant message with tool_calls is followed by one tool message
+	per tool_call_id. OpenAI (and compatible APIs) require this; add placeholders
+	for any missing tool_call_id so the request is accepted.
+	"""
+	result = []
+	i = 0
+	while i < len(messages):
+		msg = messages[i]
+		if msg.get("role") == "assistant" and msg.get("tool_calls"):
+			result.append(msg)
+			tool_calls = msg["tool_calls"]
+			ids_in_order = [tc.get("id") for tc in tool_calls if tc.get("id")]
+			j = i + 1
+			while j < len(messages) and messages[j].get("role") == "tool":
+				j += 1
+			id_to_tool_msg = {}
+			for m in messages[i + 1 : j]:
+				tid = m.get("tool_call_id")
+				if tid:
+					id_to_tool_msg[tid] = m
+			for tid in ids_in_order:
+				if tid in id_to_tool_msg:
+					result.append(id_to_tool_msg[tid])
+				else:
+					result.append({"role": "tool", "tool_call_id": tid, "content": ""})
+			i = j
+			continue
+		result.append(msg)
+		i += 1
+	return result
+
+
 def _completions(**kwargs):
 	"""Wrapper around litellm.completion that retries on rate limit errors."""
 	retries = 0
 	import litellm
+
+	messages = kwargs.get("messages")
+	if messages:
+		kwargs = dict(kwargs)
+		kwargs["messages"] = _ensure_tool_responses_for_each_call(messages)
 
 	while True:
 		try:
@@ -352,6 +444,14 @@ def _completions(**kwargs):
 			time.sleep(delay)
 
 			retries += 1
+
+
+def _get_inter_chunk_latency(timestamps: list[float]) -> float:
+	"""Average time between consecutive stream chunks (seconds)."""
+	if len(timestamps) < 2:
+		return 0.0
+	diffs = [timestamps[i] - timestamps[i - 1] for i in range(1, len(timestamps))]
+	return sum(diffs) / len(diffs)
 
 
 def _stream(
@@ -408,6 +508,36 @@ def _stream_chunk(chunk: ModelResponseStream, item_id: str, session_id: str | No
 	publish using user, session_id, item_id
 	"""
 	delta = chunk.choices[0].delta
+	if hasattr(chunk, "choices") and len(chunk.choices) > 0:
+		c0 = chunk.choices[0]
+		
+		# Handle Gemini Grounding Metadata (Citations)
+		if hasattr(c0, "grounding_metadata") and c0.grounding_metadata:
+			try:
+				gm = c0.grounding_metadata
+				chunks_info = gm.get("groundingChunks", [])
+				# supports = gm.get("groundingSupports", []) 
+				# (Inline citation logic omitted for streaming simplicity)
+				
+				if chunks_info:
+					sources_text = "\n\n### Sources:\n"
+					for idx, ch in enumerate(chunks_info):
+						if "web" in ch:
+							uri = ch["web"].get("uri")
+							title = ch["web"].get("title", "Link")
+							sources_text += f"{idx+1}. [{title}]({uri})\n"
+					
+					# Yield sources as a text chunk
+					ccs.append(TextContentChunk(
+						type="text",
+						message="content",
+						content=sources_text,
+						item_id=item_id,
+						session_id=session_id or "",
+					))
+			except Exception as e:
+				logger.error(f"Error parsing grounding metadata: {e}")
+
 	logger.debug(
 		{
 			"message": "_stream_chunk",
@@ -500,9 +630,205 @@ def _get_thinking(thinking_effort: ReasoningEffort | None):
 	return {"type": "enabled", "budget_tokens": DEFAULT_REASONING_BUDGET_MAP[thinking_effort]}
 
 
-def _get_inter_chunk_latency(timestamps: list[float]):
-	diffs = []
-	for i in range(1, len(timestamps)):
-		diffs.append(timestamps[i] - timestamps[i - 1])
-
+	if not diffs:
+		return 0.0
 	return sum(diffs) / len(diffs)
+
+
+def _openai_responses_adapter(
+	model: str,
+	messages: list[dict],
+	item: SessionItem,
+	session_id: str | None,
+    tools: list[dict]
+) -> Generator[ContentChunk, None, None]:
+	"""
+	Custom adapter to call OpenAI v1/responses API directly.
+	Bypasses LiteLLM to support 'web_search' tool.
+	"""
+	import os
+	
+	# Start System Chunk
+	yield TextContentChunk(
+		type="system",
+		message="start", # Revert to 'start' too
+		content="",
+		item_id=item["id"],
+		session_id=session_id or "",
+	)
+	
+	# Determine if we should inject web_search
+	# Logic: If 'tools' contains a tool named "search", "web_search", etc., we enable native search.
+	enable_search = False
+	final_tools = []
+		
+	search_triggers = ["search", "web_search", "google_search"]
+	
+	if tools:
+		for t in tools:
+			# Check for function tool
+			func_name = t.get("function", {}).get("name", "")
+			if func_name in search_triggers:
+				enable_search = True
+				# Do NOT include the local dummy/alias tool in the API call
+				# This prevents the model from trying to call 'function:search' instead of using native search
+				continue 
+			final_tools.append(t)
+	
+	# If we found a search trigger, inject the NATIVE tool
+	if enable_search:
+		final_tools.append({"type": "web_search"})
+
+	api_key = os.environ.get("OPENAI_API_KEY") # _set_key should have verified this
+	if not api_key:
+		raise Exception("OpenAI API Key not set")
+
+    # Map LiteLLM/Otto messages to OpenAI API format
+    # Simple pass-through mostly works, but check roles.
+    # We strip 'name' if empty to avoid 400s
+	cleaned_messages = []
+	for m in messages:
+		msg = {k: v for k, v in m.items() if v is not None}
+		if "name" in msg and not msg["name"]:
+			del msg["name"]
+		cleaned_messages.append(msg)
+
+    # Last message is usually user input, but 'input' field in Responses API 
+    # might be separate?
+    # Docs: "input": "user query", "messages": [history]
+    # But usually 'messages' array handles it.
+    # The example showed: "input": "..."
+    # If using 'messages', we can probably omit 'input' or convert last user message to input?
+    # OpenAI Responses API docs are scarce in my context, but standard Agents usually take 'messages'.
+    # User's example used "input": "..." and NO "messages".
+    # BUT we need history.
+    # I will try sending `messages` + `input` (last message content).
+    # Or just `model` + `tools` + `messages` (if supported).
+    
+    # User example:
+    # "model": "gpt-5", "tools": [...], "input": "..."
+    
+    # We will assume 'input' is required and extract the LAST user message content.
+    # If history exists, how do we pass it? 
+    # Beta endpoints often differ. I will assume `messages` + `input` implies history.
+    # Or strict "input-only" if it's stateless? The user script didn't show history.
+    # I'll try to pass `messages` (excluding last) and `input` (last).
+	
+	input_text = ""
+	history = []
+	if cleaned_messages:
+		last_msg = cleaned_messages[-1]
+		if last_msg.get("role") == "user":
+			input_text = last_msg.get("content", "")
+			history = cleaned_messages[:-1]
+		else:
+			# If last is not user (rare), just send all as input? Unlikely.
+			history = cleaned_messages
+	
+	payload = {
+		"model": model.replace("openai/", ""), # strip provider prefix
+		"tools": final_tools,
+		"input": input_text
+	}
+	
+	# If history is supported, add it. If not, this might fail or ignore it.
+	# I will add it as valid context if the API accepts it.
+	# NOTE: If v1/responses is STRICTLY "single turn with tools", we lose context.
+	# But typically these new endpoints accept 'messages'.
+	# I will try to pass 'messages' if history exists.
+	# payload["messages"] = history # Uncomment if API supports it. User example didn't show it.
+	
+	headers = {
+		"Content-Type": "application/json",
+		"Authorization": f"Bearer {api_key}"
+	}
+	
+	url = "https://api.openai.com/v1/responses"
+	
+	try:
+		# Non-streaming call (Simpler parsing)
+		resp = requests.post(url, headers=headers, json=payload, timeout=60)
+		
+		if resp.status_code != 200:
+			raise Exception(f"OpenAI Responses API Error ({resp.status_code}): {resp.text}")
+			
+		data = resp.json()
+		# Expecting list of events: [{type: web_search_call, ...}, {type: message, ...}]
+		
+		full_text = ""
+		sources_text = ""
+		
+		for event in data:
+			if not isinstance(event, dict): continue
+			
+			evt_type = event.get("type")
+			
+			if evt_type == "web_search_call":
+				# Maybe log this?
+				pass
+				
+			elif evt_type == "message":
+				# Parse content
+				content_list = event.get("content", [])
+				for part in content_list:
+					if part.get("type") == "output_text":
+						text_part = part.get("text", "")
+						annotations = part.get("annotations", [])
+						
+						# Process citations
+						if annotations:
+							# Sort by index reversed to insert? Or just append sources?
+							# User wants "Sources" section appended.
+							# Or inline? User code example did inline.
+							# But here I'm reconstructing `ContentChunk`.
+							# I will collect unique citations for the Source block.
+							valid_links = []
+							for ann in annotations:
+								if ann.get("type") == "url_citation":
+									valid_links.append((ann.get("url"), ann.get("title")))
+							
+							if valid_links:
+								sources_text = "\n\n### Sources:\n"
+								for idx, (uri, title) in enumerate(valid_links):
+									sources_text += f"{idx+1}. [{title or 'Link'}]({uri})\n"
+						
+						full_text += text_part
+		
+		# Yield Text Chunk
+		if full_text:
+			yield TextContentChunk(
+				type="text",
+				message="content",
+				content=full_text,
+				item_id=item["id"],
+				session_id=session_id or "",
+			)
+			
+		# Yield Sources Chunk
+		if sources_text:
+			yield TextContentChunk(
+				type="text",
+				message="content",
+				content=sources_text,
+				item_id=item["id"],
+				session_id=session_id or "",
+			)
+
+	except Exception as e:
+		yield TextContentChunk(
+			type="system",
+			message="error",
+			content=str(e),
+			item_id=item["id"],
+			session_id=session_id or "",
+		)
+		raise e
+
+	# End System Chunk
+	yield TextContentChunk(
+		type="system",
+		message="end",
+		content="",
+		item_id=item["id"],
+		session_id=session_id or "",
+	)

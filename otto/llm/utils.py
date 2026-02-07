@@ -394,6 +394,9 @@ def get_provider(model: str) -> Provider | None:
 	if model.startswith("gemini"):
 		return "Google"
 
+	if model.startswith("groq"):
+		return "Groq"
+
 	return None
 
 
@@ -406,6 +409,8 @@ def get_provider_key(provider: Provider):
 			return "ANTHROPIC_API_KEY"
 		case "Google":
 			return "GEMINI_API_KEY"
+		case "Groq":
+			return "GROQ_API_KEY"
 		case _:
 			return None
 
