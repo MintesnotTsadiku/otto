@@ -201,8 +201,13 @@ def interact(
 	if model.startswith("gemini"):
 		if tools is None:
 			tools = []
-		# Check if already present to avoid duplicates
-		if not any("google_search" in str(t) for t in tools):
+		# If a web_search tool is present, replace with Gemini native grounding.
+		has_web_search = any(t.get("function", {}).get("name") == "web_search" for t in tools)
+		if has_web_search:
+			tools = [t for t in tools if t.get("function", {}).get("name") != "web_search"]
+			tools.append({"google_search_retrieval": {}})
+		# Otherwise ensure a default public Google search tool is present
+		elif not any("google_search" in str(t) for t in tools):
 			# LiteLLM format for Gemini Google Search (Public Grounding)
 			# Note: We use 'google_search' not 'google_search_retrieval' (Vertex Enterprise)
 			tools.append({"google_search": {}})
