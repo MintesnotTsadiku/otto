@@ -14,6 +14,7 @@
   "anthropic_api_key",
   "openai_api_key",
   "gemini_api_key",
+  "enable_gemini_grounding_two_step",
   "groq_api_key",
   "env_section",
   "global_env"
@@ -56,6 +57,13 @@
    "fieldname": "gemini_api_key",
    "fieldtype": "Password",
    "label": "Gemini API Key (Google)"
+  },
+  {
+   "default": "1",
+   "description": "If enabled, Otto runs a second Gemini call to fetch Google Search grounding/citations when function tools are used. This avoids Gemini's limitation that disallows googleSearch + function tools in the same request.",
+   "fieldname": "enable_gemini_grounding_two_step",
+   "fieldtype": "Check",
+   "label": "Enable Gemini Two-Step Grounding"
   },
   {
    "fieldname": "groq_api_key",

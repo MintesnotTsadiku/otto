@@ -61,6 +61,7 @@ if TYPE_CHECKING:
 
 
 logger = otto.logger("otto.llm.litellm", "ERROR")
+debug_logger = otto.logger("otto.llm.litellm.debug", "INFO")
 
 
 class StreamReturn(NamedTuple):
@@ -173,6 +174,11 @@ def interact(
 		item["meta"]["output_tokens"] = usage.get("completion_tokens", 0)
 		item["meta"]["cost"] = kwargs.get("standard_logging_object", {}).get("response_cost", None)
 		item["content"] = _get_content(completion_response)
+		# Attach grounding sources (Gemini Google Search) if available
+		grounding = _extract_grounding_metadata(completion_response)
+		sources_text = _format_grounding_sources(grounding)
+		if sources_text:
+			item["content"].append(TextContent(type="text", text=sources_text))
 		item["meta"]["end_reason"] = end_reason
 		logger.debug({"message": "callback done set", "id": item["id"]})
 		done.set()
@@ -187,6 +193,7 @@ def interact(
 	)
 
 	think = {}
+	grounding_followup = False
 	if reasoning_effort and reasoning_effort != "None":
 		think["reasoning_effort"] = reasoning_effort.lower()  # litellm expects "low", "medium", "high"
 
@@ -201,16 +208,70 @@ def interact(
 	if model.startswith("gemini"):
 		if tools is None:
 			tools = []
-		# If a web_search tool is present, replace with Gemini native grounding.
-		has_web_search = any(t.get("function", {}).get("name") == "web_search" for t in tools)
-		if has_web_search:
-			tools = [t for t in tools if t.get("function", {}).get("name") != "web_search"]
-			tools.append({"google_search_retrieval": {}})
-		# Otherwise ensure a default public Google search tool is present
-		elif not any("google_search" in str(t) for t in tools):
-			# LiteLLM format for Gemini Google Search (Public Grounding)
-			# Note: We use 'google_search' not 'google_search_retrieval' (Vertex Enterprise)
-			tools.append({"google_search": {}})
+		def _tool_name(t: dict | None) -> str | None:
+			if not isinstance(t, dict):
+				return None
+			if isinstance(t.get("function"), dict):
+				return t.get("function", {}).get("name")
+			return t.get("name")
+
+		def _is_function_tool(t: dict | None) -> bool:
+			if not isinstance(t, dict):
+				return False
+			if isinstance(t.get("function"), dict):
+				return True
+			return "name" in t and "parameters" in t
+
+		try:
+			tool_names = [_tool_name(t) for t in tools]
+			debug_logger.info(
+				{
+					"event": "gemini_tools_received",
+					"model": model,
+					"tool_names": tool_names,
+				}
+			)
+		except Exception:
+			pass
+
+		# Treat web_search/google_search as triggers for Gemini grounding
+		has_web_search = any(_tool_name(t) == "web_search" for t in tools)
+		has_google_search_trigger = any(_tool_name(t) == "google_search" for t in tools)
+		if has_web_search or has_google_search_trigger:
+			tools = [t for t in tools if _tool_name(t) not in ("web_search", "google_search")]
+		# Normalize to current Gemini API tool: google_search (not googleSearchRetrieval or googleSearch)
+		if any("googleSearchRetrieval" in str(t) or "google_search_retrieval" in str(t) or "googleSearch" in str(t) for t in tools):
+			tools = [t for t in tools if "googleSearchRetrieval" not in str(t) and "google_search_retrieval" not in str(t) and "googleSearch" not in str(t)]
+		has_function_tools = any(_is_function_tool(t) for t in tools)
+		has_google_search = (
+			any("google_search" in str(t) for t in tools)
+			or has_web_search
+			or has_google_search_trigger
+		)
+		try:
+			debug_logger.info(
+				{
+					"event": "gemini_tools_flags",
+					"model": model,
+					"has_function_tools": has_function_tools,
+					"has_google_search": has_google_search,
+					"grounding_followup_enabled": _is_two_step_grounding_enabled(),
+				}
+			)
+		except Exception:
+			pass
+		# Gemini AI Studio/Vertex rejects google_search + function tools together.
+		# Use a two-step approach (enabled by setting): tools first, then grounding-only follow-up.
+		if has_function_tools:
+			if _is_two_step_grounding_enabled() and has_google_search:
+				grounding_followup = True
+			# Ensure no google_search tool is sent with function tools
+			tools = [t for t in tools if "googleSearch" not in str(t) and "google_search" not in str(t)]
+		else:
+			# No function tools: LiteLLM will handle google_search via web_search_options in non-streaming calls
+			if has_google_search:
+				# Strip the web_search tool from the tools list
+				tools = [t for t in tools if "googleSearch" not in str(t) and "google_search" not in str(t)]
 
 	# Inject native Web Search for OpenAI models
 	# (Disabled: OpenAI Chat Completions does not support 'web_search' tool type)
@@ -249,11 +310,16 @@ def interact(
 		
 		# Update session and return
 		logger.debug({"message": "updating session", "id": item["id"]})
-		update_session(update, last_id, item)
+		if _has_meaningful_content(item):
+			update_session(update, last_id, item)
+		else:
+			logger.debug({"message": "skipping empty session item", "id": item["id"]})
 		item["meta"]["end_time"] = time.time()
 		response = InteractReturn(item=item, update=update, chunks=chunks)
 		return InteractReturnTuple(response, None)
 
+	logger.debug({"message": "calling litellm.completion", "id": item["id"]})
+	
 	logger.debug({"message": "calling litellm.completion", "id": item["id"]})
 	completion = _completions(
 		model=model,
@@ -300,9 +366,113 @@ def interact(
 		}
 	)
 
+	# Two-step grounding follow-up for Gemini when function tools were present
+	if grounding_followup:
+		try:
+			answer_text = _extract_text_answer(item["content"])
+			has_tool_use = any(c.get("type") == "tool_use" for c in item["content"])
+			if has_tool_use:
+				logger.debug("Gemini grounding follow-up skipped: tool_use present in this turn.")
+			query_text = query if isinstance(query, str) else json.dumps(query)
+			if answer_text and not has_tool_use:
+				try:
+					debug_logger.info(
+						{
+							"event": "gemini_grounding_followup_start",
+							"model": model,
+							"answer_chars": len(answer_text),
+						}
+					)
+				except Exception:
+					pass
+				ground_prompt = _build_grounding_prompt(query_text, answer_text)
+				try:
+					debug_logger.info(
+						{
+							"event": "gemini_grounding_request",
+							"model": model,
+							"prompt_chars": len(ground_prompt),
+						}
+					)
+				except Exception:
+					pass
+				# Use web_search_options for both Google AI Studio and Vertex AI
+				ground_resp = litellm.completion(
+					model=model,
+					messages=[{"role": "user", "content": ground_prompt}],
+					web_search_options={"search_context_size": "medium"},
+					stream=False,
+					drop_params=True,
+				)
+				try:
+					# Convert to dict for easier inspection
+					resp_dict = ground_resp if isinstance(ground_resp, dict) else ground_resp.dict() if hasattr(ground_resp, "dict") else {}
+					choices = resp_dict.get("choices", [])
+					first_choice = choices[0] if choices else {}
+					message = first_choice.get("message", {}) if isinstance(first_choice, dict) else {}
+					
+					debug_logger.info(
+						{
+							"event": "gemini_grounding_response",
+							"model": model,
+							"response_type": type(ground_resp).__name__,
+							"response_keys": list(resp_dict.keys()) if isinstance(resp_dict, dict) else [],
+							"has_choices": bool(choices),
+							"choice_keys": list(first_choice.keys()) if isinstance(first_choice, dict) else [],
+							"message_keys": list(message.keys()) if isinstance(message, dict) else [],
+							"message_content_preview": str(message.get("content"))[:100] if message.get("content") else None,
+						}
+					)
+				except Exception as e:
+					debug_logger.error({"event": "gemini_grounding_response_log_error", "error": str(e)})
+				grounding = _extract_grounding_metadata(ground_resp)
+				try:
+					debug_logger.info(
+						{
+							"event": "gemini_grounding_followup_done",
+							"model": model,
+							"has_grounding": bool(grounding),
+						}
+					)
+				except Exception:
+					pass
+				grounded_text = (
+					(ground_resp.get("choices") or [{}])[0].get("message", {}).get("content")
+					if isinstance(ground_resp, dict)
+					else None
+				)
+				grounded_text = grounded_text or answer_text
+				sources_text = _format_grounding_sources(grounding)
+				# Preserve non-text content (e.g. tool_use), replace text with grounded answer + sources
+				non_text = [c for c in item["content"] if c.get("type") != "text"]
+				item["content"] = [*non_text, TextContent(type="text", text=grounded_text)]
+				if sources_text:
+					item["content"].append(TextContent(type="text", text=sources_text))
+				# Stream grounded answer + sources
+				chunks.append(TextContentChunk(
+					type="text",
+					message="content",
+					content=grounded_text,
+					item_id=item["id"],
+					session_id=session_id or "",
+				))
+				if sources_text:
+					chunks.append(TextContentChunk(
+						type="text",
+						message="content",
+						content=sources_text,
+						item_id=item["id"],
+						session_id=session_id or "",
+					))
+		except Exception as e:
+			logger.warning(f"Gemini grounding follow-up failed: {e}")
+
 	logger.debug({"message": "updating session", "id": item["id"]})
 	# Update the update session with the item
-	update_session(update, last_id, item)
+	if _has_meaningful_content(item):
+		update_session(update, last_id, item)
+	else:
+		logger.debug({"message": "skipping empty session item", "id": item["id"]})
 
 	item["meta"]["end_time"] = time.time()
 
@@ -387,6 +557,179 @@ def _get_tool_use_content(message: dict[str, Any]) -> list[ToolUseContent]:
 			)
 		)
 	return content
+
+
+def _extract_grounding_metadata(completion_response: dict) -> dict | None:
+	"""Best-effort extraction of Gemini grounding metadata from LiteLLM response."""
+	
+	# LiteLLM exposes Gemini grounding metadata at the top level
+	for top_key in ("vertex_ai_grounding_metadata", "grounding_metadata", "groundingMetadata"):
+		if top_key in completion_response:
+			return completion_response.get(top_key)
+	
+	# Check response.choices[0].message and response.choices[0] for other providers
+	choice = (completion_response.get("choices") or [{}])[0]
+	message = choice.get("message") or {}
+	
+	# Debug logging
+	try:
+		debug_logger.info({
+			"event": "extract_grounding_debug",
+			"response_keys": list(completion_response.keys())[:15] if isinstance(completion_response, dict) else [],
+			"choice_keys": list(choice.keys()) if isinstance(choice, dict) else [],
+			"message_keys": list(message.keys()) if isinstance(message, dict) else [],
+			"has_candidates": "candidates" in completion_response,
+		})
+	except Exception:
+		pass
+	
+	# LiteLLM may expose grounding metadata at different levels depending on provider
+	for key in ("groundingMetadata", "grounding_metadata"):
+		if key in message:
+			return message.get(key)
+		if key in choice:
+			return choice.get(key)
+	# Some providers return candidates list
+	candidate = (completion_response.get("candidates") or [{}])[0]
+	for key in ("groundingMetadata", "grounding_metadata"):
+		if key in candidate:
+			return candidate.get(key)
+	return None
+
+
+def _format_grounding_sources(grounding: dict | None) -> str:
+	"""Build a simple Sources section from grounding metadata."""
+	if not grounding:
+		return ""
+	if isinstance(grounding, list):
+		grounding = grounding[0] if grounding else None
+		if not grounding:
+			return ""
+	chunks = grounding.get("groundingChunks") or grounding.get("grounding_chunks") or []
+	if not chunks:
+		return ""
+	lines = ["\n\n### Sources:\n"]
+	for idx, ch in enumerate(chunks):
+		web = ch.get("web") if isinstance(ch, dict) else None
+		if not web:
+			continue
+		uri = web.get("uri")
+		title = web.get("title", "Link")
+		if uri:
+			lines.append(f"{idx + 1}. [{title}]({uri})\n")
+	return "".join(lines)
+
+
+def _has_meaningful_content(item: SessionItem) -> bool:
+	"""Return True if the item contains any meaningful content."""
+	content = item.get("content") or []
+	for c in content:
+		if not isinstance(c, dict):
+			continue
+		if c.get("type") == "text" and c.get("text", "").strip():
+			return True
+		if c.get("type") in ("tool_use", "thinking"):
+			return True
+	return False
+
+
+def format_grounding_sources(grounding: dict | None) -> str:
+	"""Public wrapper for formatting grounding sources."""
+	return _format_grounding_sources(grounding)
+
+
+def run_web_search(model: str, query: str) -> dict:
+	"""Run native web search based on model provider."""
+	import os
+	import requests
+	import litellm
+
+	if reason := _set_key(model):
+		raise Exception(reason)
+
+	provider = get_provider(model) or ""
+
+	# OpenAI: use Responses API with web_search tool
+	if provider == "openai" or model.startswith("openai/") or model.startswith("gpt-"):
+		api_key = os.environ.get("OPENAI_API_KEY")
+		if not api_key:
+			raise Exception("OpenAI API Key not set")
+
+		payload = {
+			"model": model.replace("openai/", ""),
+			"tools": [{"type": "web_search"}],
+			"input": query,
+		}
+		headers = {
+			"Content-Type": "application/json",
+			"Authorization": f"Bearer {api_key}",
+		}
+		resp = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=60)
+		if resp.status_code != 200:
+			raise Exception(f"OpenAI Responses API Error ({resp.status_code}): {resp.text}")
+		data = resp.json()
+
+		text = data.get("output_text") or ""
+		if not text:
+			output = data.get("output") or []
+			parts = []
+			for out in output:
+				if not isinstance(out, dict):
+					continue
+				for c in out.get("content", []) or []:
+					if not isinstance(c, dict):
+						continue
+					if c.get("type") in ("output_text", "text") and c.get("text"):
+						parts.append(c["text"])
+			text = "".join(parts)
+
+		return {"content": text or "Search completed.", "grounding": None, "raw": data}
+
+	# Gemini / others: use LiteLLM web_search_options
+	resp = litellm.completion(
+		model=model,
+		messages=[{"role": "user", "content": f"Search the web and provide citations for: {query}"}],
+		web_search_options={"search_context_size": "medium"},
+		stream=False,
+		drop_params=True,
+	)
+	resp_dict = resp if isinstance(resp, dict) else resp.dict() if hasattr(resp, "dict") else {}
+	content = resp_dict.get("choices", [{}])[0].get("message", {}).get("content", "")
+	grounding = _extract_grounding_metadata(resp_dict)
+	if isinstance(grounding, list):
+		grounding = grounding[0] if grounding else None
+	return {"content": content or "Search completed.", "grounding": grounding, "raw": resp_dict}
+
+def _is_two_step_grounding_enabled() -> bool:
+	"""Check Otto Settings toggle for Gemini two-step grounding."""
+	try:
+		import frappe
+		val = frappe.get_cached_value(
+			"Otto Settings",
+			"Otto Settings",
+			"enable_gemini_grounding_two_step",
+		)
+		if val is None:
+			return True
+		return bool(int(val))
+	except Exception:
+		return True
+
+
+def _extract_text_answer(item_content: list[Content]) -> str:
+	"""Extract plain text from content list."""
+	parts = []
+	for c in item_content:
+		if c.get("type") == "text" and c.get("text"):
+			parts.append(c.get("text"))
+	return "\n".join(parts).strip()
+
+
+def _build_grounding_prompt(query_text: str, answer_text: str) -> str:
+	"""Prompt for grounding follow-up when function tools were used."""
+	return (
+		f"Search the web to answer this question and provide citations:\n\n{query_text}"
+	)
 
 
 def _ensure_tool_responses_for_each_call(messages: list[dict]) -> list[dict]:
@@ -671,8 +1014,12 @@ def _openai_responses_adapter(
 	
 	if tools:
 		for t in tools:
-			# Check for function tool
-			func_name = t.get("function", {}).get("name", "")
+			# Check for function tool or ToolSchema dict
+			func_name = ""
+			if isinstance(t.get("function"), dict):
+				func_name = t.get("function", {}).get("name", "")
+			elif isinstance(t.get("name"), str):
+				func_name = t.get("name", "")
 			if func_name in search_triggers:
 				enable_search = True
 				# Do NOT include the local dummy/alias tool in the API call

@@ -15,6 +15,7 @@ class OttoSettings(Document):
 		from frappe.types import DF
 
 		anthropic_api_key: DF.Password | None
+		enable_gemini_grounding_two_step: DF.Check
 		gemini_api_key: DF.Password | None
 		global_env: DF.JSON | None
 		is_enabled: DF.Check
