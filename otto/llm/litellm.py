@@ -1025,7 +1025,16 @@ def _openai_responses_adapter(
 				# Do NOT include the local dummy/alias tool in the API call
 				# This prevents the model from trying to call 'function:search' instead of using native search
 				continue 
-			final_tools.append(t)
+				
+			# OpenAI Responses API (beta) expects standard tool structure:
+			# {"type": "function", "function": {...}}
+			# Do NOT unwrap the function definition into the top level.
+			raw_tool = dict(t)
+			if "type" not in raw_tool:
+				raw_tool["type"] = "function"
+			
+			# Ensure it's in final_tools
+			final_tools.append(raw_tool)
 	
 	# If we found a search trigger, inject the NATIVE tool
 	if enable_search:
@@ -1071,10 +1080,20 @@ def _openai_responses_adapter(
 	if cleaned_messages:
 		last_msg = cleaned_messages[-1]
 		if last_msg.get("role") == "user":
-			input_text = last_msg.get("content", "")
+			content = last_msg.get("content", "")
+			if isinstance(content, list):
+				# Extract text from complex content list
+				text_parts = []
+				for part in content:
+					if isinstance(part, dict) and part.get("type") == "text":
+						text_parts.append(part.get("text", ""))
+					elif isinstance(part, str):
+						text_parts.append(part)
+				input_text = "\n".join(text_parts).strip()
+			else:
+				input_text = str(content)
 			history = cleaned_messages[:-1]
 		else:
-			# If last is not user (rare), just send all as input? Unlikely.
 			history = cleaned_messages
 	
 	payload = {
@@ -1101,11 +1120,23 @@ def _openai_responses_adapter(
 		# Non-streaming call (Simpler parsing)
 		resp = requests.post(url, headers=headers, json=payload, timeout=60)
 		
-		if resp.status_code != 200:
-			raise Exception(f"OpenAI Responses API Error ({resp.status_code}): {resp.text}")
-			
-		data = resp.json()
 		# Expecting list of events: [{type: web_search_call, ...}, {type: message, ...}]
+		# Or a single object with 'usage' and/or 'output'
+		data = resp.json()
+		# DEBUG LOG - Remove after verification
+		import json as json_lib
+		otto.log_error("OpenAI Responses API Debug", model=model, response_body=json_lib.dumps(data, indent=2))
+		
+		# If it's a list, it might be the events array directly
+		events = data if isinstance(data, list) else data.get("events", [])
+		usage = data.get("usage", {}) if isinstance(data, dict) else {}
+		
+		# If usage not in top level, maybe it's an event?
+		if not usage and isinstance(events, list):
+			for evt in events:
+				if isinstance(evt, dict) and evt.get("type") == "usage":
+					usage = evt.get("usage", {})
+					break
 		
 		full_text = ""
 		sources_text = ""
@@ -1156,12 +1187,12 @@ def _openai_responses_adapter(
 				session_id=session_id or "",
 			)
 			
-		# Yield Sources Chunk
-		if sources_text:
+		# Yield Usage Chunk (Critical for tracking)
+		if usage:
 			yield TextContentChunk(
-				type="text",
-				message="content",
-				content=sources_text,
+				type="system",
+				message="usage",
+				content=json.dumps(usage),
 				item_id=item["id"],
 				session_id=session_id or "",
 			)
